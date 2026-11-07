@@ -152,6 +152,27 @@ jobs:
 
       - name: Build kernel
         run: |
+          cat > /tmp/patch_task_mmu.py <<'PY'
+          import glob, pathlib, re, time
+          for _ in range(900):
+              for f in glob.glob('/tmp/gki-build/*/common/fs/proc/task_mmu.c'):
+                  p = pathlib.Path(f)
+                  try:
+                      s = p.read_text()
+                  except Exception:
+                      continue
+                  changed = False
+                  if 'struct dentry *dentry = NULL;' in s and '__maybe_unused' not in s:
+                      s = s.replace('struct dentry *dentry = NULL;', 'struct dentry *dentry __maybe_unused = NULL;')
+                      changed = True
+                  if 'if (0) goto bypass;' not in s and re.search(r'(?m)^\s*bypass:', s):
+                      s = re.sub(r'(?m)^(\s*)bypass:', r'\1if (0) goto bypass;\n\1bypass:', s, count=1)
+                      changed = True
+                  if changed:
+                      p.write_text(s)
+              time.sleep(2)
+          PY
+          nohup python3 /tmp/patch_task_mmu.py >/tmp/patch_task_mmu.log 2>&1 &
           cd ./.github/workflows/scripts
 
           ARGS="--android ${{ github.event.inputs.android_version }}"
