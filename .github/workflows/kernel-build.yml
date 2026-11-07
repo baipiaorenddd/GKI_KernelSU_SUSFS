@@ -168,6 +168,9 @@ jobs:
                   if 'if (0) goto bypass;' not in s and re.search(r'(?m)^\s*bypass:', s):
                       s = re.sub(r'(?m)^(\s*)bypass:', r'\1if (0) goto bypass;\n\1bypass:', s, count=1)
                       changed = True
+                  if 'static void show_vma_header_prefix_fake(' in s:
+                      s = s.replace('static void show_vma_header_prefix_fake(', 'static void __maybe_unused show_vma_header_prefix_fake(')
+                      changed = True
                   if changed:
                       p.write_text(s)
               time.sleep(2)
