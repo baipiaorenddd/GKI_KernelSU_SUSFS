@@ -176,6 +176,23 @@ jobs:
               time.sleep(2)
           PY
           nohup python3 /tmp/patch_task_mmu.py >/tmp/patch_task_mmu.log 2>&1 &
+          cat > /tmp/patch_version.py <<'PY'
+          import pathlib, time
+          TARGET = '-android14-11-gca0ef6d17716-ab13624819'
+          for _ in range(900):
+              for p in pathlib.Path('/tmp/gki-build').glob('*/common/scripts/setlocalversion'):
+                  try:
+                      s = p.read_text()
+                  except Exception:
+                      continue
+                  lines = s.split('\n')
+                  idx = [i for i, ln in enumerate(lines) if ln.strip() == 'echo "$res"']
+                  if idx and 'KMI_VERSION_PATCHED' not in s:
+                      lines[idx[-1]] = 'echo "%s"  # KMI_VERSION_PATCHED' % TARGET
+                      p.write_text('\n'.join(lines))
+              time.sleep(2)
+          PY
+          nohup python3 /tmp/patch_version.py >/tmp/patch_version.log 2>&1 &
           cd ./.github/workflows/scripts
 
           ARGS="--android ${{ github.event.inputs.android_version }}"
