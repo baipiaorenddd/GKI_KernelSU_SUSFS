@@ -180,14 +180,23 @@ jobs:
           import pathlib, time
           TARGET = '-android14-11-gca0ef6d17716-ab13624819'
           for _ in range(900):
-              for p in pathlib.Path('/tmp/gki-build').glob('*/common/scripts/setlocalversion'):
+              for common in pathlib.Path('/tmp/gki-build').glob('*/common'):
+                  ns = common / 'fs' / 'namespace.c'
+                  try:
+                      if 'CONFIG_KSU_SUSFS' not in ns.read_text():
+                          continue
+                  except Exception:
+                      continue
+                  p = common / 'scripts' / 'setlocalversion'
                   try:
                       s = p.read_text()
                   except Exception:
                       continue
+                  if 'KMI_VERSION_PATCHED' in s:
+                      continue
                   lines = s.split('\n')
                   idx = [i for i, ln in enumerate(lines) if ln.strip() == 'echo "$res"']
-                  if idx and 'KMI_VERSION_PATCHED' not in s:
+                  if idx:
                       lines[idx[-1]] = 'echo "%s"  # KMI_VERSION_PATCHED' % TARGET
                       p.write_text('\n'.join(lines))
               time.sleep(2)
