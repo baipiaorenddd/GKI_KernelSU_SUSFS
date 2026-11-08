@@ -1,0 +1,184 @@
+name: Houji KMI Build
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      os_patch:
+        description: 'GKI branch suffix (2025-12 / 2025-09)'
+        required: true
+        default: '2025-12'
+
+env:
+  HOUJI_COMMIT: 0c3d559bcd85c64dae9c9c9687abbe5347fff3ad
+  HOUJI_RELEASE: -android14-11-g0c3d559bcd85-ab14529422
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize build space
+        uses: AdityaGarg8/remove-unwanted-software@v5
+        with:
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          remove-large-packages: 'true'
+          remove-swapfile: 'true'
+          verbose: 'true'
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache python3 git curl wget zip unzip
+          pip install PyYAML
+
+      - name: Configure ccache
+        run: |
+          mkdir -p ~/.cache/bazel
+          ccache --max-size=2G
+          ccache --set-config=compression=true
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: Build kernel
+        run: |
+          cat > /tmp/houji_build.py <<'PY'
+          import os, re, sys, pathlib
+          sys.path.insert(0, '.github/workflows/scripts')
+          import kernel_builder as kb
+
+          K = kb.KernelBuilder
+          COMMIT = os.environ['HOUJI_COMMIT']
+          RELEASE = os.environ['HOUJI_RELEASE']
+
+
+          def read_sub(common):
+              try:
+                  text = (pathlib.Path(common) / 'Makefile').read_text()
+              except Exception:
+                  return None
+              m = re.search(r'^SUBLEVEL\s*=\s*(\d+)', text, re.M)
+              return m.group(1) if m else None
+
+
+          _sync = K.init_and_sync_kernel
+
+
+          def sync(self):
+              _sync(self)
+              common = self.work_dir / 'common'
+              branch = self.config.formatted_branch
+              print('HOUJI: synced branch=%s' % branch, flush=True)
+              attempts = [
+                  'git -C {c} fetch --depth=1 origin {sha} && git -C {c} checkout -q --detach {sha}',
+                  'git -C {c} fetch origin {sha} && git -C {c} checkout -q --detach {sha}',
+                  'curl -fsSL https://android.googlesource.com/kernel/common/+archive/{sha}.tar.gz | tar -xz -C {c}',
+              ]
+              for i, tpl in enumerate(attempts, 1):
+                  self._run_cmd(tpl.format(c=common, sha=COMMIT), check=False)
+                  sub = read_sub(common)
+                  print('HOUJI: pin attempt %d -> SUBLEVEL=%s' % (i, sub), flush=True)
+                  if sub == '138':
+                      print('HOUJI: source pinned to %s' % COMMIT, flush=True)
+                      return
+              raise SystemExit('HOUJI: failed to pin kernel source to 6.1.138')
+
+
+          K.init_and_sync_kernel = sync
+
+          _susfs = K.apply_susfs_patches
+
+
+          def susfs(self):
+              common = self.work_dir / 'common'
+              ns = common / 'fs' / 'namespace.c'
+              if ns.exists():
+                  text = ns.read_text()
+                  if '#include <trace/hooks/blk.h>' not in text:
+                      text = text.replace('#include "internal.h"\n',
+                                          '#include "internal.h"\n#include <trace/hooks/blk.h>\n', 1)
+                      ns.write_text(text)
+                      print('HOUJI: inserted blk.h include into fs/namespace.c', flush=True)
+                  hdr = common / 'include' / 'trace' / 'hooks' / 'blk.h'
+                  hdr.parent.mkdir(parents=True, exist_ok=True)
+                  if not hdr.exists():
+                      hdr.write_text('/* stub: SUSFS patch context expects this include */\n')
+              _susfs(self)
+
+
+          K.apply_susfs_patches = susfs
+
+          _vname = K.configure_kernel_name
+
+
+          def vname(self):
+              _vname(self)
+              p = self.work_dir / 'common' / 'scripts' / 'setlocalversion'
+              lines = p.read_text().split('\n')
+              idx = [i for i, ln in enumerate(lines) if ln.strip() == 'echo "$res"']
+              if not idx:
+                  raise SystemExit('HOUJI: setlocalversion echo marker missing')
+              lines[idx[-1]] = 'echo "%s"  # HOUJI_VERSION' % RELEASE
+              p.write_text('\n'.join(lines))
+              print('HOUJI: release forced to %s' % RELEASE, flush=True)
+
+
+          K.configure_kernel_name = vname
+
+          import build as B
+          sys.exit(B.main())
+          PY
+          cat > /tmp/patch_task_mmu.py <<'PY'
+          import glob, pathlib, re, time
+          for _ in range(900):
+              for f in glob.glob('/tmp/gki-build/*/common/fs/proc/task_mmu.c'):
+                  p = pathlib.Path(f)
+                  try:
+                      s = p.read_text()
+                  except Exception:
+                      continue
+                  changed = False
+                  if 'struct dentry *dentry = NULL;' in s and '__maybe_unused' not in s:
+                      s = s.replace('struct dentry *dentry = NULL;', 'struct dentry *dentry __maybe_unused = NULL;')
+                      changed = True
+                  if 'if (0) goto bypass;' not in s and re.search(r'(?m)^\s*bypass:', s):
+                      s = re.sub(r'(?m)^(\s*)bypass:', r'\1if (0) goto bypass;\n\1bypass:', s, count=1)
+                      changed = True
+                  if 'static void show_vma_header_prefix_fake(' in s:
+                      s = s.replace('static void show_vma_header_prefix_fake(', 'static void __maybe_unused show_vma_header_prefix_fake(')
+                      changed = True
+                  if changed:
+                      p.write_text(s)
+              time.sleep(2)
+          PY
+          nohup python3 /tmp/patch_task_mmu.py > /tmp/patch_task_mmu.log 2>&1 &
+          cd .github/workflows/scripts
+          python3 /tmp/houji_build.py --android android14 --kernel 6.1 --sub-level 138 --os-patch "${{ github.event.inputs.os_patch }}" --no-kpm --no-release
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          find /tmp/gki-build -name "*.zip" -type f -exec cp {} artifacts/ \;
+          find /tmp/gki-build -name "*.img" -type f -exec cp {} artifacts/ \;
+          find /tmp/gki-build -name "Image" -type f -exec cp {} artifacts/Image-raw \;
+          ls -la artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: houji-6.1.138
+          path: artifacts/*
